@@ -606,6 +606,19 @@ def test_control_rejects_sequence_parallel_before_weight_loading(control_startup
         resolve_root.assert_not_called()
 
 
+@pytest.mark.parametrize("strategy", ["full", "pre_sharded"])
+def test_control_rejects_hsdp_before_weight_loading(control_startup, strategy):
+    # The controlnet. weight source is outside the DiT HSDP groups, so ControlNet
+    # must never reach either HSDP loading strategy.
+    pipeline_module, config = control_startup
+    config.parallel_config.use_hsdp = True
+    config.hsdp_weight_load_strategy = strategy
+    with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
+        with pytest.raises(ValueError, match="no cache/offload/SP/HSDP"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+        resolve_root.assert_not_called()
+
+
 def test_control_rows_and_padded_sequence_survive_denoise_preparation():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 

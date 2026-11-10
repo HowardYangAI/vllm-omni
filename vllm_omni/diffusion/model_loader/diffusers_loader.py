@@ -1497,7 +1497,30 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
-        load_with_checkpoint_proxies(self, model, discovered_modules, hsdp_config, target_device)
+        loaded = load_with_checkpoint_proxies(self, model, discovered_modules, hsdp_config, target_device)
+        # Sources outside the DiTs (e.g. a MiniMax-H3 text encoder) are not
+        # HSDP-managed: load and post-process them like the full strategy does.
+        dit_names = discovered_modules.outermost_dits()[0]
+        dit_prefixes = tuple(f"{name}." for name in dit_names)
+        other_sources = [source for source in self._get_weight_sources(model) if source.prefix not in dit_prefixes]
+        if other_sources:
+            dit_ids = {id(model.get_submodule(name)) for name in dit_names}
+            planned = [name for name, _ in model.named_parameters() if name.startswith(dit_prefixes)]
+            self.load_weights(model, sources=other_sources, planned_weights=planned)
+            # The DiT groups were processed before sharding; process only modules
+            # outside them so quantized non-DiT layers are finalized exactly once.
+            outside = []
+            for name, module in model.named_modules():
+                if id(module) in dit_ids:
+                    continue
+                if any(name.startswith(prefix) for prefix in dit_prefixes):
+                    continue
+                outside.append(module)
+            self._process_weights_after_loading(model, target_device, modules_to_process=outside)
+        # Model checks that need the names the DiT groups actually loaded.
+        validate = getattr(model, "validate_pre_sharded_dit_load", None)
+        if callable(validate):
+            validate(loaded)
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
             "Loading weights took %.2f seconds",
@@ -1507,11 +1530,17 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         return model
 
     @staticmethod
-    def _check_no_unplanned_meta_tensors(model: nn.Module, planned_names: frozenset[str]) -> None:
+    def _check_no_unplanned_meta_tensors(
+        model: nn.Module,
+        planned_names: frozenset[str],
+        *,
+        prefixes: tuple[str, ...] = ("",),
+    ) -> None:
+        """Reject meta tensors under ``prefixes`` that the checkpoint plan does not cover."""
         unplanned_meta = [
             name
             for name, tensor in (*model.named_parameters(), *model.named_buffers())
-            if tensor.device.type == "meta" and name not in planned_names
+            if tensor.device.type == "meta" and name.startswith(prefixes) and name not in planned_names
         ]
         if unplanned_meta:
             raise ValueError(

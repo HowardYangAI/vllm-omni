@@ -93,11 +93,11 @@ def _plan_checkpoint_groups(
         raise ValueError("No DiT modules discovered for HSDP sharding")
     if int(getattr(loader.parallel_config, "tensor_parallel_size", 1)) != 1:
         raise ValueError("Pre-sharded checkpoint proxies require tensor_parallel_size=1")
-    sources = loader._get_weight_sources(model)
     expected_prefixes = {f"{name}." for name in root_names}
+    # Only DiT sources are proxy-loaded. Other sources (text encoder, ...) are
+    # loaded by the caller through the ordinary load_weights path.
+    sources = tuple(s for s in loader._get_weight_sources(model) if s.prefix in expected_prefixes)
     available_prefixes = {source.prefix for source in sources}
-    if available_prefixes - expected_prefixes:
-        raise ValueError("Pre-sharded checkpoint proxies require dedicated DiT checkpoint sources")
     if missing := expected_prefixes - available_prefixes:
         raise ValueError(f"Pre-sharded checkpoint sources are missing DiT prefixes: {sorted(missing)}")
     remap_fn = getattr(type(model), "_remap_ckpt_key", None)
@@ -130,7 +130,10 @@ def _plan_checkpoint_groups(
                 if getattr(module, key) is not None
             )
     planned: frozenset[str] = frozenset().union(*(group.required_names for group in groups.values()))
-    loader._check_no_unplanned_meta_tensors(model, planned)
+    # Only DiT tensors must be covered here. Online-quantized layers of other
+    # components (e.g. an FP8 text encoder) start on meta and are materialized
+    # by the ordinary loader that runs after the DiT groups.
+    loader._check_no_unplanned_meta_tensors(model, planned, prefixes=tuple(f"{name}." for name in root_names))
     for source in sources:
         checkpoint_entries = _build_source_map(
             sources=(source,),
@@ -353,13 +356,14 @@ def load_with_checkpoint_proxies(
     discovered: PipelineModules,
     hsdp_config: HSDPInferenceConfig,
     target_device: torch.device,
-) -> None:
+) -> set[str]:
     """Plan groups, DCP-load proxy shards once, then load/process/shard real blocks.
 
     Real blocks are materialized when visited; models may release their initial
     storage to meta during construction. Only full gathered tensors reach native
     loaders and backend postprocessing. Completed real shards replace proxies;
     the final group for each DiT handles weights outside its decoder blocks.
+    Returns the full names of every tensor the DiT groups loaded.
     """
     groups, planned = _plan_checkpoint_groups(loader, model, discovered)
     use_tqdm_on_load = loader.load_config.use_tqdm_on_load
@@ -380,3 +384,4 @@ def load_with_checkpoint_proxies(
         # Pass the popped proxy directly so no caller reference survives loading.
         loaded.update(_load_group_weights(loader, model, group, proxies.pop(group.name), convert_tensor, target_device))
         _process_and_shard_group(loader, group, hsdp_config, proxy_context, target_device, loaded, planned)
+    return loaded

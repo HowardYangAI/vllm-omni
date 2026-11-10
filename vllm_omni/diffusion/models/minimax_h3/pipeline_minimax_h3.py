@@ -1398,6 +1398,19 @@ class MiniMaxH3Pipeline(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
         )
 
+    @staticmethod
+    def _remap_ckpt_key(name: str) -> str:
+        """Map a Diffusers DiT block prefix to the runtime ``blocks.N`` group name.
+
+        Only the block prefix changes so pre-sharded HSDP block groups can claim
+        their tensors; ``MiniMaxH3DiTModel.load_block_weights`` converts the rest.
+        """
+        for prefix in ("transformer.", "transformers_ref."):
+            old = prefix + "transformer_blocks."
+            if name.startswith(old):
+                return prefix + "blocks." + name[len(old) :]
+        return name
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -1449,6 +1462,49 @@ class MiniMaxH3Pipeline(
             if component is None:
                 continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
+        if "transformer." in loaded_prefixes:
+            # A stream without the DiT (pre-sharded loading streams only the other
+            # sources) has nothing to validate here.
+            self._validate_dit_load(transformer_loaded)
+        return loaded_with_prefix
+
+    def validate_pre_sharded_dit_load(self, loaded: Iterable[str]) -> None:
+        """Run the DiT load checks on names loaded outside ``load_weights`` (pre-sharded HSDP)."""
+        for name in ("transformer", "transformers_ref"):
+            component = getattr(self, name, None)
+            if component is not None and getattr(component, "_adaln_sidecar_candidate", None) is not None:
+                # The sidecar is verified against streamed root weights; per-block
+                # loading bypasses that stream, so fall back to runtime projections.
+                object.__setattr__(component, "_adaln_sidecar_candidate", None)
+                logger.warning(
+                    "Ignoring the optional H3 AdaLN sidecar for %s with pre-sharded HSDP loading; "
+                    "runtime AdaLN caching remains enabled",
+                    name,
+                )
+        loaded = set(loaded)
+        for name in ("transformer", "transformers_ref"):
+            component = getattr(self, name, None)
+            if component is None:
+                continue
+            if getattr(component, "controlnet", None) is not None:
+                # ControlNet weights come from a separate controlnet. source that
+                # pre-sharded loading does not plan; the constructor rejects
+                # ControlNet with HSDP, so this only guards future callers.
+                raise ValueError("MiniMax-H3 ControlNet does not support pre-sharded HSDP loading")
+            prefix = f"{name}."
+            # Every DiT, including the combined service's Ref2VA DiT, must have
+            # loaded each tensor its checkpoint plan requires.
+            missing = sorted(
+                f"{prefix}{param_name}"
+                for param_name, param in component.named_parameters()
+                if f"{prefix}{param_name}" not in loaded and not getattr(param, "is_checkpoint_optional", False)
+            )
+            if missing:
+                raise ValueError(f"MiniMax-H3 {name} pre-sharded load is incomplete: {missing[:16]}")
+        prefix = "transformer."
+        self._validate_dit_load({name.removeprefix(prefix) for name in loaded if name.startswith(prefix)})
+
+    def _validate_dit_load(self, transformer_loaded: set[str]) -> None:
         if self._vdn is not None:
             self._vdn.validate(transformer_loaded, self.transformer.vdn_parameter_names())
         if self._fasth3 is not None:
@@ -1467,7 +1523,6 @@ class MiniMaxH3Pipeline(
                 )
             if missing_gates := required_gates - transformer_loaded:
                 raise ValueError(f"FastH3 V2 checkpoint is missing compression gates: {sorted(missing_gates)}")
-        return loaded_with_prefix
 
     @property
     def lora_is_fused(self) -> bool:
